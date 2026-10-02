@@ -3,6 +3,8 @@ from copy import deepcopy
 from datetime import date, datetime
 from pathlib import Path
 import uuid
+from io import BytesIO
+from PIL import Image, ImageDraw, ImageFont
 import streamlit as st
 from storage import load_root, save_root, load_huddle, save_huddle, load_exceptions, save_exceptions
 
@@ -210,6 +212,122 @@ def assignment_grid(staff,special,cfg,locs,key,edit,d,off_names):
         special[x]=render_row(x,special[x],True,x=='Off')
     return staff,special,sorted(set(duplicates))
 
+
+
+def _font(size, bold=False):
+    candidates = [
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf' if bold else '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+        '/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf' if bold else '/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf',
+    ]
+    for path in candidates:
+        if Path(path).exists():
+            return ImageFont.truetype(path, size)
+    return ImageFont.load_default()
+
+
+def _wrap(draw, text, font, width):
+    words = str(text or '').split()
+    if not words:
+        return ['']
+    lines, current = [], words[0]
+    for word in words[1:]:
+        trial = current + ' ' + word
+        if draw.textbbox((0, 0), trial, font=font)[2] <= width:
+            current = trial
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+def _draw_table(draw, x, y, widths, headers, rows, header_fill, first_col_colors=None):
+    header_font = _font(22, True)
+    body_font = _font(20)
+    body_bold = _font(20, True)
+    pad = 12
+    header_h = 54
+    xx = x
+    for idx, (label, width) in enumerate(zip(headers, widths)):
+        draw.rounded_rectangle((xx, y, xx + width, y + header_h), radius=5, fill=header_fill, outline='#c4ccd4', width=2)
+        draw.text((xx + pad, y + 14), label, font=header_font, fill='white')
+        xx += width
+    y += header_h
+    for row_index, row in enumerate(rows):
+        wrapped = []
+        max_lines = 1
+        for value, width in zip(row, widths):
+            lines = _wrap(draw, value if value else '—', body_font, width - 2 * pad)
+            wrapped.append(lines)
+            max_lines = max(max_lines, len(lines))
+        row_h = max(50, 14 + max_lines * 25)
+        xx = x
+        for col_index, (lines, width) in enumerate(zip(wrapped, widths)):
+            fill = '#ffffff' if row_index % 2 == 0 else '#f5f7f9'
+            if first_col_colors and col_index == 0:
+                fill = first_col_colors[row_index]
+            draw.rectangle((xx, y, xx + width, y + row_h), fill=fill, outline='#cbd3da', width=2)
+            color = '#ffffff' if first_col_colors and col_index == 0 else '#343a40'
+            font = body_bold if col_index == 0 else body_font
+            for line_index, line in enumerate(lines):
+                draw.text((xx + pad, y + 9 + line_index * 25), line, font=font, fill=color)
+            xx += width
+        y += row_h
+    return y
+
+
+def huddle_png(d, metrics, staff, special, locs):
+    width = 1900
+    margin = 55
+    title_font = _font(38, True)
+    subtitle_font = _font(25, True)
+    small_font = _font(18)
+    probe = Image.new('RGB', (width, 100), 'white')
+    pd = ImageDraw.Draw(probe)
+
+    metric_widths = [250, 225, 190, 210, 210, 210, 180]
+    metric_rows = [[loc] + [str(metrics.get(loc, {}).get(m, '') or '—') for m in METRICS] for loc in locs]
+    staffing_widths = [250, 280, 240, 240, 420, 300]
+    staffing_rows = []
+    for loc in locs + SPECIAL_ROWS:
+        row = staff[loc] if loc in staff else special[loc]
+        staffing_rows.append([loc] + [', '.join(row[r]) or '—' for r in ROLES])
+
+    def table_height(rows, widths, font):
+        total = 54
+        for row in rows:
+            max_lines = 1
+            for value, col_width in zip(row, widths):
+                max_lines = max(max_lines, len(_wrap(pd, value if value else '—', font, col_width - 24)))
+            total += max(50, 14 + max_lines * 25)
+        return total
+
+    height = 175 + table_height(metric_rows, metric_widths, _font(20)) + 70 + table_height(staffing_rows, staffing_widths, _font(20)) + 80
+    image = Image.new('RGB', (width, height), '#f6f7f8')
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((25, 25, width - 25, height - 25), radius=18, fill='white', outline='#d5dce3', width=3)
+    draw.text((margin, 48), 'Pediatric Cardiology Daily Huddle', font=title_font, fill='#2670c8')
+    draw.text((margin, 98), d.strftime('%A, %B %d, %Y'), font=subtitle_font, fill='#8fae15')
+    draw.text((width - 410, 62), 'Wellstar Children’s of Georgia', font=small_font, fill='#6b7280')
+
+    y = 145
+    draw.text((margin, y), 'Daily Activity by Location', font=subtitle_font, fill='#2670c8')
+    y += 42
+    first_colors = [COLORS[i % len(COLORS)] for i in range(len(metric_rows))]
+    y = _draw_table(draw, margin, y, metric_widths, ['Location'] + METRICS, metric_rows, '#2670c8', first_colors)
+
+    y += 36
+    draw.text((margin, y), 'Staff Scheduling', font=subtitle_font, fill='#cf303b')
+    y += 42
+    special_colors = ['#5b82aa', '#5b82aa', '#5b82aa', '#bd4b55']
+    staffing_colors = [COLORS[i % len(COLORS)] for i in range(len(locs))] + special_colors
+    y = _draw_table(draw, margin, y, staffing_widths, ['Location', 'MD', 'RN', 'MA', 'Sonographers', 'FOS'], staffing_rows, '#cf303b', staffing_colors)
+
+    draw.text((margin, height - 55), 'Planning recommendation. Confirm final staffing before operational use.', font=small_font, fill='#6b7280')
+    buffer = BytesIO()
+    image.save(buffer, format='PNG', optimize=True)
+    return buffer.getvalue()
+
 def snapshot_text(d,metrics,staff,special,locs):
     lines=[f'Daily Huddle: {d.strftime("%A %B %d, %Y")}', '', 'Locations:']
     lines.append('Location | '+' | '.join(METRICS))
@@ -287,11 +405,11 @@ with st.expander('Time off and coverage',True):
                 ex=load_exceptions(); ex=[x for x in ex if x.get('id')!=e.get('id')]; save_exceptions(ex); st.rerun()
     else:st.caption('No one is off for this date.')
 
-snapshot=snapshot_text(selected,record['metrics'],staff,special,locs)
-with st.expander('Share Daily Huddle snapshot',False):
-    st.caption('Use the copy icon in the upper-right of the snapshot, or download the text file.')
-    st.code(snapshot,language=None)
-    st.download_button('Download snapshot',snapshot,file_name=f'daily_huddle_{selected}.txt',mime='text/plain',use_container_width=True)
+with st.expander('Share Daily Huddle picture',False):
+    png_bytes=huddle_png(selected,record['metrics'],staff,special,locs)
+    st.image(png_bytes,caption='Daily Huddle picture preview',use_container_width=True)
+    st.download_button('Download colorful Daily Huddle PNG',png_bytes,file_name=f'daily_huddle_{selected}.png',mime='image/png',use_container_width=True)
+    st.caption('Download the PNG, then paste or attach it in Teams or email.')
 buttons=st.columns([1,1,4])
 if buttons[0].button('Save huddle',type='primary',use_container_width=True):
     record.update({'date':str(selected),'session':session,'staffing':staff,'special_assignments':special,'saved_at':datetime.now().isoformat(timespec='seconds')}); save_huddle(str(selected),session,record); st.success('Saved to Google Drive JSON.')
