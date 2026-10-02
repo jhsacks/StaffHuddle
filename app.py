@@ -1,120 +1,83 @@
-import json
-from datetime import date, datetime, timedelta
-from pathlib import Path
+
+import uuid
+from datetime import date
+import pandas as pd
 import streamlit as st
-from storage import load_huddle, save_huddle, load_exceptions, save_exceptions
+from logic import rebalance
+from storage import load, save
 
-st.set_page_config(page_title="Pediatric Cardiology Daily Huddle", page_icon="🌼", layout="wide")
-BASELINE=json.loads((Path(__file__).parent/"data"/"baseline.json").read_text())
-LOCATIONS=["Kennesaw","Smyrna","Douglasville","Avalon","LaGrange","New Hope","Woodstock"]
-ROLES=["MD","RN","MA","SON","FOS"]
-METRICS=["Clinic/Patients","Echoes","Stress Tests","Nurse Visits","Video Visit","Fetal"]
-ALIASES={"Kennesaw":"Barrett","New Hope":"Paulding","LaGrange":"Lagrange"}
-COLORS={"Kennesaw":"#efa51b","Smyrna":"#17945a","Douglasville":"#b5367d","Avalon":"#6c8f42","LaGrange":"#277b7f","New Hope":"#b3c933","Woodstock":"#d25135"}
+st.set_page_config(page_title="Clinic Staffing Planner", layout="wide")
+st.title("Clinic Staffing Planner")
+data=load()
 
-st.markdown("""<style>
-:root{--blue:#2670c8;--orange:#efa51b;--green:#17945a;--red:#c83d44;--pink:#b5367d;--lime:#b3c933;--teal:#277b7f;--line:#cbd1d6;--ink:#3d4146;--bg:#f6f7f8}
-.stApp{background:var(--bg);color:var(--ink)}.block-container{max-width:1180px;padding-top:1.4rem}.hero{display:flex;justify-content:space-between;align-items:end;gap:18px}.hero h1{margin:0;color:var(--blue);font-size:26px;font-style:italic}.hero p{margin:3px 0 0;color:#6c737a}.huddle-title{font-size:28px;color:var(--lime);font-weight:800;font-style:italic;margin:.8rem 0}.section-title{font-size:20px;font-weight:750;font-style:italic;margin:.3rem 0}.card{background:white;border:1px solid #d8dde1;border-radius:9px;box-shadow:0 2px 12px #0000000a;padding:14px;margin:12px 0}.loc{font-weight:750;font-style:italic}.small{color:#697078;font-size:12px}div[data-testid="stNumberInput"] input{background:#fffdf4}div[data-testid="stMultiSelect"]{background:#fffdf4;border-radius:6px}.stButton button{border-radius:6px}button[kind="primary"]{background:var(--blue)}
-@media print{header,.stAppDeployButton,div[data-testid="stSidebar"],.no-print{display:none!important}.block-container{max-width:none;padding:0}.card{box-shadow:none}}
-</style>""",unsafe_allow_html=True)
+def commit(): save(data); st.success("Saved"); st.rerun()
 
-def week_of(d):
-    anchor=date(2026,10,4)
-    return ((d-anchor).days//7)%4+1
+tab_daily, tab_off, tab_roster, tab_roles = st.tabs(["Daily coverage", "Time off", "Staff roster", "Roles"])
 
-def day_key(d,session): return f"{week_of(d)}-{d.strftime('%a')}-{session}"
-def match(assign,loc): return ALIASES.get(loc,loc).lower() in str(assign).lower()
-def default_staff(d,session):
-    sessions=["AM","PM"] if session=="BOTH" else [session]
-    out={loc:{r:[] for r in ROLES} for loc in LOCATIONS}
-    for role,people in BASELINE.items():
-        for person,pattern in people.items():
-            for sess in sessions:
-                assign=pattern.get(day_key(d,sess),"n/a")
-                for loc in LOCATIONS:
-                    if match(assign,loc) and person not in out[loc][role]: out[loc][role].append(person)
-    return out
+with tab_daily:
+    selected=st.date_input("Date", value=date.today()).isoformat()
+    session=st.selectbox("Session", ["AM","PM"])
+    day=next((d for d in data["days"] if d["date"]==selected and d["session"]==session), None)
+    if not day:
+        st.info("No baseline is stored for this session.")
+    else:
+        rec=rebalance(day, data["roster"], data["exceptions"])
+        if rec["off"]: st.warning("Off: " + ", ".join(rec["off"]))
+        rows=[]
+        for c in rec["clinics"]:
+            if c.get("closed"):
+                rows.append({"Location":c["location"],"Status":"CLOSED","Role":"","Staff":""})
+            else:
+                for a in c.get("assignments",[]):
+                    p=next((x for x in data["roster"] if x["id"]==a["person_id"]), {"name":a["person_id"]})
+                    rows.append({"Location":c["location"],"Status":"OPEN","Role":a["role"],"Staff":p["name"]})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        if rec["warnings"]:
+            for w in rec["warnings"]: st.error(w)
+        st.subheader("Recommended changes")
+        st.dataframe(pd.DataFrame(rec["changes"]), use_container_width=True, hide_index=True)
+        st.caption("Recommendations require scheduler review. Baseline assignments are not overwritten automatically.")
 
-def all_people(role): return sorted(BASELINE.get(role,{}).keys())
+with tab_off:
+    st.subheader("Who's off")
+    selected=st.date_input("Exception date", value=date.today(), key="exdate").isoformat()
+    same=[e for e in data["exceptions"] if e["date"]==selected]
+    for e in same:
+        p=next((x for x in data["roster"] if x["id"]==e["person_id"]), {"name":e["person_id"]})
+        c1,c2,c3=st.columns([4,2,1])
+        c1.write(f'{p["name"]} · {e["status"]} · {e.get("session","ALL")}')
+        if c3.button("Reinstate", key=e["id"]):
+            data["exceptions"]=[x for x in data["exceptions"] if x["id"]!=e["id"]]; commit()
+    with st.form("addoff"):
+        person=st.selectbox("Person", data["roster"], format_func=lambda p:p["name"])
+        status=st.selectbox("Status", ["PTO","OFF","LEAVE","UNAVAILABLE"])
+        sess=st.selectbox("Applies to", ["ALL","AM","PM"])
+        if st.form_submit_button("Mark off"):
+            data["exceptions"].append({"id":str(uuid.uuid4()),"person_id":person["id"],"date":selected,"session":sess,"status":status}); commit()
 
-def apply_exceptions(staff,d,session,exceptions):
-    active=[x for x in exceptions if x.get("start")<=str(d)<=x.get("end")]
-    changes=[]
-    for x in active:
-        person=x["person"]; role=x["role"]
-        for loc in LOCATIONS:
-            if person in staff[loc].get(role,[]):
-                staff[loc][role].remove(person); changes.append(f"{person} removed from {loc}")
-                if role=="MD": staff[loc]["closed"]=True
-        repl=x.get("replacement")
-        loc=x.get("location")
-        if repl and loc and loc in staff: staff[loc][role].append(repl); changes.append(f"{repl} covers {loc} for {person}")
-    return staff,changes
+with tab_roster:
+    st.subheader("Add staff member")
+    with st.form("person"):
+        name=st.text_input("Name")
+        roles=st.multiselect("Qualified roles", data["roles"])
+        prefs=st.text_input("Preferred locations, best first (comma-separated)")
+        blocked=st.text_input("Unavailable locations (comma-separated)")
+        if st.form_submit_button("Add") and name and roles:
+            data["roster"].append({"id":str(uuid.uuid4()),"name":name,"roles":roles,"preferences":[x.strip() for x in prefs.split(',') if x.strip()],"unavailable_locations":[x.strip() for x in blocked.split(',') if x.strip()],"active":True}); commit()
+    for p in data["roster"]:
+        c1,c2,c3=st.columns([4,2,1])
+        c1.write(f'{p["name"]} · {", ".join(p.get("roles",[]))}')
+        c2.write("Active" if p.get("active",True) else "Inactive")
+        if c3.button("Remove" if p.get("active",True) else "Restore", key="person"+p["id"]):
+            p["active"]=not p.get("active",True); commit()
 
-st.markdown('<div class="hero"><div><h1>Pediatric Cardiology Daily Huddle</h1><p>Baseline staffing loads automatically; daily counts and approved changes save to Google Drive.</p></div></div>',unsafe_allow_html=True)
-ctrl=st.columns([1.4,1,1,1])
-with ctrl[0]: selected=st.date_input("Date",value=date.today(),format="MM/DD/YYYY")
-with ctrl[1]: session=st.selectbox("Session",["BOTH","AM","PM"],format_func=lambda x:"AM + PM" if x=="BOTH" else x)
-with ctrl[2]: admin=st.toggle("Admin mode",value=False)
-with ctrl[3]: st.markdown(f'<div class="small" style="padding-top:34px">Week {week_of(selected)} pattern</div>',unsafe_allow_html=True)
-key=f"{selected}|{session}"
-if st.session_state.get("record_key")!=key:
-    st.session_state.record_key=key
-    st.session_state.record=load_huddle(str(selected),session)
-record=st.session_state.record
-record.setdefault("metrics",{})
-record.setdefault("staffing",default_staff(selected,session))
-record.setdefault("footer",{"Admin":"Jackie, Heather","Hospital":"Kim","On Leave":"","Remote":"Tia, Nicole","Off":""})
-exceptions=load_exceptions()
-record["staffing"],change_log=apply_exceptions(record["staffing"],selected,session,exceptions)
-st.markdown(f'<div class="huddle-title">Daily Huddle: {selected.strftime("%A %B %-d, %Y")} 🌼</div>',unsafe_allow_html=True)
-
-st.markdown('<div class="section-title" style="color:#2670c8">Locations</div>',unsafe_allow_html=True)
-heads=st.columns([1.35,1,1,1,1,1,1])
-for c,t,col in zip(heads,["Locations:"]+METRICS,["#2670c8","#efa51b","#17945a","#c83d44","#b5367d","#d25135","#17945a"]): c.markdown(f'<b><i style="color:{col}">{t}</i></b>',unsafe_allow_html=True)
-for loc in LOCATIONS:
-    row=st.columns([1.35,1,1,1,1,1,1]); row[0].markdown(f'<span class="loc" style="color:{COLORS[loc]}">{loc}</span>',unsafe_allow_html=True)
-    for i,m in enumerate(METRICS,1):
-        v=record["metrics"].setdefault(loc,{}).get(m,0)
-        record["metrics"][loc][m]=row[i].number_input(f"{loc}-{m}",min_value=0,value=int(v or 0),label_visibility="collapsed",key=f"m-{key}-{loc}-{m}")
-
-st.markdown('<div class="section-title" style="color:#c83d44;margin-top:24px">Staff Scheduling</div>',unsafe_allow_html=True)
-heads=st.columns([1.35,1.25,1,1,1.35,1,1])
-for c,t,col in zip(heads,["Staff Scheduling:","MD","RN","MA","Sonographers","FOS","Call Center"],["#c83d44","#d25135","#efa51b","#b3c933","#17945a","#b5367d","#277b7f"]): c.markdown(f'<b><i style="color:{col}">{t}</i></b>',unsafe_allow_html=True)
-for loc in LOCATIONS:
-    row=st.columns([1.35,1.25,1,1,1.35,1,1]); row[0].markdown(f'<span class="loc" style="color:{COLORS[loc]}">{loc}</span>',unsafe_allow_html=True)
-    closed=record["staffing"][loc].get("closed",False)
-    for i,role in enumerate(ROLES,1):
-        current=record["staffing"][loc].get(role,[])
-        if admin:
-            record["staffing"][loc][role]=row[i].multiselect(f"{loc}-{role}",all_people(role),default=[x for x in current if x in all_people(role)],label_visibility="collapsed",key=f"s-{key}-{loc}-{role}")
-        else:
-            text="CLINIC CLOSED" if closed and role=="MD" else ", ".join(current)
-            row[i].markdown(text or "&nbsp;",unsafe_allow_html=True)
-    record["staffing"][loc]["Call Center"]=row[6].text_input(f"{loc}-call",value=record["staffing"][loc].get("Call Center",""),label_visibility="collapsed",key=f"call-{key}-{loc}")
-if change_log: st.warning(" | ".join(change_log))
-
-st.markdown('<br>',unsafe_allow_html=True)
-footer_cols=st.columns([1.3,.8,1.1,.8])
-for c,label in zip(footer_cols,["Admin","Hospital","On Leave","Off"]): record["footer"][label]=c.text_input(label,value=record["footer"].get(label,""),key=f"f-{key}-{label}")
-record["footer"]["Remote"]=st.text_input("Remote",value=record["footer"].get("Remote",""),key=f"f-{key}-remote")
-
-buttons=st.columns([1,1,4])
-if buttons[0].button("Save huddle",type="primary",use_container_width=True):
-    record["saved_at"]=datetime.now().isoformat(timespec="seconds")
-    record["date"]=str(selected); record["session"]=session
-    save_huddle(str(selected),session,record); st.success("Saved to Google Drive JSON.")
-if buttons[1].button("Reload saved",use_container_width=True):
-    st.session_state.record=load_huddle(str(selected),session); st.rerun()
-
-if admin:
-    with st.expander("Time off and coverage",expanded=False):
-        cols=st.columns([1.2,1,1,1.2,1.2,1])
-        roles=ROLES; role=cols[0].selectbox("Role",roles); person=cols[1].selectbox("Person",all_people(role)); start=cols[2].date_input("From",selected); end=cols[3].date_input("To",selected); loc=cols[4].selectbox("Coverage location",[""]+LOCATIONS); repl=cols[5].selectbox("Replacement",[""]+all_people(role))
-        if st.button("Add exception"):
-            exceptions.append({"person":person,"role":role,"start":str(start),"end":str(end),"location":loc,"replacement":repl}); save_exceptions(exceptions); st.success("Exception saved."); st.rerun()
-        if exceptions:
-            st.dataframe(exceptions,use_container_width=True,hide_index=True)
-            if st.button("Clear all exceptions"): save_exceptions([]); st.rerun()
-
-st.caption("Planning recommendation only. Confirm clinic closures, qualifications, leave, travel constraints, and final staffing before operational use.")
+with tab_roles:
+    st.write("Roles: " + ", ".join(data["roles"]))
+    with st.form("role"):
+        role=st.text_input("New role")
+        if st.form_submit_button("Add role") and role and role not in data["roles"]:
+            data["roles"].append(role); commit()
+    removable=[r for r in data["roles"] if not any(r in p.get("roles",[]) for p in data["roster"] if p.get("active",True))]
+    role_to_remove=st.selectbox("Remove unused role", [""]+removable)
+    if st.button("Remove role") and role_to_remove:
+        data["roles"].remove(role_to_remove); commit()

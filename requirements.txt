@@ -1,3 +1,2 @@
-streamlit>=1.39
-google-api-python-client>=2.149
-google-auth>=2.35
+streamlit>=1.40
+pandas>=2.0

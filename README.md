@@ -1,14 +1,13 @@
-# StaffHuddle
+# Clinic staffing update
 
-Standalone Streamlit Daily Huddle app.
+Drop these files into the existing Streamlit app or merge the modules. The logic provides:
 
-## Deploy
-1. Upload these files to `jhsacks/StaffHuddle`.
-2. In Streamlit Community Cloud, create an app using `app.py`.
-3. Copy your **existing** Google Drive service-account credentials and existing JSON file ID into Streamlit app Secrets using `secrets.example.toml` as the template.
-4. Share the existing Google Drive JSON file with the service account email as Editor.
+- PTO/OFF/LEAVE exceptions with same-day reinstate
+- automatic closure when all baseline MD coverage at a clinic is removed
+- redeployment of staff from closed clinics
+- role-qualified replacement coverage using ranked location preferences
+- hard enforcement of inactive staff, leave, role qualification, and unavailable locations
+- add/remove staff and add/remove unused roles
+- visible change log and uncovered-role warnings
 
-The app preserves all existing root JSON keys and writes only under `daily_huddle`.
-
-## Data safety
-Do not commit `.streamlit/secrets.toml` or service-account JSON credentials.
+Run with `streamlit run app.py`. Recommendations require human approval.
