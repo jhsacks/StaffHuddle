@@ -114,7 +114,27 @@ if admin:
         if st.button("Add exception"):
             exceptions.append({"person":person,"role":role,"start":str(start),"end":str(end),"location":loc,"replacement":repl}); save_exceptions(exceptions); st.success("Exception saved."); st.rerun()
         if exceptions:
-            st.dataframe(exceptions,use_container_width=True,hide_index=True)
-            if st.button("Clear all exceptions"): save_exceptions([]); st.rerun()
+
+        labels = [
+            f"{e['person']} | {e['role']} | {e['start']} -> {e['end']}"
+            for e in exceptions
+        ]
+
+        selected = st.selectbox(
+            "Remove exception",
+            labels
+        )
+
+        if st.button("Remove selected exception"):
+
+            idx = labels.index(selected)
+
+            exceptions.pop(idx)
+
+            save_exceptions(exceptions)
+
+            st.rerun()
+
+    st.dataframe(exceptions)
 
 st.caption("Planning recommendation only. Confirm clinic closures, qualifications, leave, travel constraints, and final staffing before operational use.")
