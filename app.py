@@ -242,87 +242,156 @@ def _wrap(draw, text, font, width):
 
 
 def _draw_table(draw, x, y, widths, headers, rows, header_fill, first_col_colors=None):
-    header_font = _font(42, True)
-    body_font = _font(38)
-    body_bold = _font(40, True)    pad = 12
-    header_h = 54
+    header_font = _font(24, True)
+    body_font = _font(22)
+    body_bold = _font(22, True)
+    pad = 8
+    header_h = 44
+
     xx = x
-    for idx, (label, width) in enumerate(zip(headers, widths)):
-        draw.rounded_rectangle((xx, y, xx + width, y + header_h), radius=5, fill=header_fill, outline='#c4ccd4', width=2)
-        draw.text((xx + pad, y + 14), label, font=header_font, fill='white')
-        xx += width
+    for label, col_width in zip(headers, widths):
+        draw.rounded_rectangle(
+            (xx, y, xx + col_width, y + header_h),
+            radius=4,
+            fill=header_fill,
+            outline='#c4ccd4',
+            width=1,
+        )
+        draw.text((xx + pad, y + 9), label, font=header_font, fill='white')
+        xx += col_width
+
     y += header_h
     for row_index, row in enumerate(rows):
         wrapped = []
         max_lines = 1
-        for value, width in zip(row, widths):
-            lines = _wrap(draw, value if value else '—', body_font, width - 2 * pad)
+        for value, col_width in zip(row, widths):
+            lines = _wrap(draw, value if value else '—', body_font, col_width - (2 * pad))
             wrapped.append(lines)
             max_lines = max(max_lines, len(lines))
-        row_h = max(42, 10 + max_lines * 32)
+
+        row_h = max(38, 8 + max_lines * 25)
         xx = x
-        for col_index, (lines, width) in enumerate(zip(wrapped, widths)):
+        for col_index, (lines, col_width) in enumerate(zip(wrapped, widths)):
             fill = '#ffffff' if row_index % 2 == 0 else '#f5f7f9'
             if first_col_colors and col_index == 0:
                 fill = first_col_colors[row_index]
-            draw.rectangle((xx, y, xx + width, y + row_h), fill=fill, outline='#cbd3da', width=2)
+            draw.rectangle(
+                (xx, y, xx + col_width, y + row_h),
+                fill=fill,
+                outline='#cbd3da',
+                width=1,
+            )
             color = '#ffffff' if first_col_colors and col_index == 0 else '#343a40'
             font = body_bold if col_index == 0 else body_font
             for line_index, line in enumerate(lines):
-                draw.text((xx + pad, y + 6 + line_index * 32), line, font=font, fill=color)
-            xx += width
+                draw.text(
+                    (xx + pad, y + 5 + line_index * 25),
+                    line,
+                    font=font,
+                    fill=color,
+                )
+            xx += col_width
         y += row_h
     return y
 
 
 def huddle_png(d, metrics, staff, special, locs):
-    width = 2800
-    margin = 55
-    title_font = _font(38, True)
-    subtitle_font = _font(25, True)
-    small_font = _font(18)
+    margin = 18
+    metric_widths = [150, 145, 115, 135, 130, 125, 105]
+    staffing_widths = [135, 155, 145, 145, 220, 155]
+    width = max(sum(metric_widths), sum(staffing_widths)) + (2 * margin)
+
+    title_font = _font(32, True)
+    subtitle_font = _font(22, True)
+    small_font = _font(15)
+    table_font = _font(22)
+
     probe = Image.new('RGB', (width, 100), 'white')
     pd = ImageDraw.Draw(probe)
 
-    metric_widths = [250, 225, 190, 210, 210, 210, 180]
-    metric_rows = [[loc] + [str(metrics.get(loc, {}).get(m, '') or '—') for m in METRICS] for loc in locs]
-    staffing_widths = [180, 230, 210, 210, 320, 220]
+    metric_rows = [
+        [loc] + [str(metrics.get(loc, {}).get(metric, '') or '—') for metric in METRICS]
+        for loc in locs
+    ]
     staffing_rows = []
     for loc in locs + SPECIAL_ROWS:
         row = staff[loc] if loc in staff else special[loc]
-        staffing_rows.append([loc] + [', '.join(row[r]) or '—' for r in ROLES])
+        staffing_rows.append([loc] + [', '.join(row[role]) or '—' for role in ROLES])
 
-    def table_height(rows, widths, font):
-        total = 54
+    def table_height(rows, widths):
+        total = 44
         for row in rows:
             max_lines = 1
             for value, col_width in zip(row, widths):
-                max_lines = max(max_lines, len(_wrap(pd, value if value else '—', font, col_width - 24)))
-            total += max(50, 14 + max_lines * 25)
+                max_lines = max(
+                    max_lines,
+                    len(_wrap(pd, value if value else '—', table_font, col_width - 16)),
+                )
+            total += max(38, 8 + max_lines * 25)
         return total
 
-    height = 175 + table_height(metric_rows, metric_widths, _font(20)) + 70 + table_height(staffing_rows, staffing_widths, _font(20)) + 80
+    top_area = 126
+    section_gap = 54
+    footer_area = 48
+    height = (
+        top_area
+        + table_height(metric_rows, metric_widths)
+        + section_gap
+        + table_height(staffing_rows, staffing_widths)
+        + footer_area
+    )
+
     image = Image.new('RGB', (width, height), '#f6f7f8')
     draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((25, 25, width - 25, height - 25), radius=18, fill='white', outline='#d5dce3', width=3)
-    draw.text((margin, 48), 'Pediatric Cardiology Daily Huddle', font=title_font, fill='#2670c8')
-    draw.text((margin, 98), d.strftime('%A, %B %d, %Y'), font=subtitle_font, fill='#8fae15')
-    draw.text((width - 410, 62), 'Wellstar Children’s of Georgia', font=small_font, fill='#6b7280')
+    draw.rounded_rectangle(
+        (7, 7, width - 7, height - 7),
+        radius=12,
+        fill='white',
+        outline='#d5dce3',
+        width=2,
+    )
 
-    y = 145
+    draw.text((margin, 18), 'Pediatric Cardiology Daily Huddle', font=title_font, fill='#2670c8')
+    draw.text((margin, 58), d.strftime('%A, %B %d, %Y'), font=subtitle_font, fill='#8fae15')
+
+    y = 94
     draw.text((margin, y), 'Daily Activity by Location', font=subtitle_font, fill='#2670c8')
-    y += 42
-    first_colors = [COLORS[i % len(COLORS)] for i in range(len(metric_rows))]
-    y = _draw_table(draw, margin, y, metric_widths, ['Location'] + METRICS, metric_rows, '#2670c8', first_colors)
+    y += 30
+    metric_colors = [COLORS[i % len(COLORS)] for i in range(len(metric_rows))]
+    y = _draw_table(
+        draw,
+        margin,
+        y,
+        metric_widths,
+        ['Location'] + METRICS,
+        metric_rows,
+        '#2670c8',
+        metric_colors,
+    )
 
-    y += 36
+    y += 20
     draw.text((margin, y), 'Staff Scheduling', font=subtitle_font, fill='#cf303b')
-    y += 42
+    y += 30
     special_colors = ['#5b82aa', '#5b82aa', '#5b82aa', '#bd4b55']
     staffing_colors = [COLORS[i % len(COLORS)] for i in range(len(locs))] + special_colors
-    y = _draw_table(draw, margin, y, staffing_widths, ['Location', 'MD', 'RN', 'MA', 'Sonographers', 'FOS'], staffing_rows, '#cf303b', staffing_colors)
+    y = _draw_table(
+        draw,
+        margin,
+        y,
+        staffing_widths,
+        ['Location', 'MD', 'RN', 'MA', 'Sonographers', 'FOS'],
+        staffing_rows,
+        '#cf303b',
+        staffing_colors,
+    )
 
-    draw.text((margin, height - 55), 'Planning recommendation. Confirm final staffing before operational use.', font=small_font, fill='#6b7280')
+    draw.text(
+        (margin, height - 32),
+        'Planning recommendation. Confirm final staffing before operational use.',
+        font=small_font,
+        fill='#6b7280',
+    )
+
     buffer = BytesIO()
     image.save(buffer, format='PNG', optimize=True)
     return buffer.getvalue()
