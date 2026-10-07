@@ -69,8 +69,47 @@ def baseline_staff(d,session,cfg):
                     if matches(assignment,loc) and name not in out[loc][role]: out[loc][role].append(name)
     return out
 
-def exceptions_for(d):
-    ds=str(d); return [e for e in load_exceptions() if e.get('start','')<=ds<=e.get('end','')]
+def exceptions_for(d, session):
+    ds = str(d)
+    return [
+        e for e in load_exceptions()
+        if e.get('start', '') <= ds <= e.get('end', '')
+        and (session == 'BOTH' or e.get('session', 'BOTH') in ('BOTH', session))
+    ]
+
+
+def work_parts(name, loc, d):
+    role = next((r for r, people in BASELINE.items() if name in people), None)
+    if not role:
+        return []
+    pattern = BASELINE[role].get(name, {})
+    parts = []
+    for part in ('AM', 'PM'):
+        assignment = pattern.get(slot_key(d, part), 'n/a')
+        if matches(assignment, loc):
+            parts.append(part)
+    return parts
+
+
+def display_name(name, loc, d, selected_session, exceptions=None):
+    if loc in SPECIAL_ROWS or selected_session != 'BOTH':
+        return name
+
+    exceptions = exceptions or []
+    off_parts = {
+        e.get('session', 'BOTH')
+        for e in exceptions
+        if e.get('person') == name
+    }
+
+    # Keep normal full-day and normal half-day assignments uncluttered.
+    # Add a label only when a partial-day time-off exception changes availability.
+    if 'AM' in off_parts and 'PM' not in off_parts and 'BOTH' not in off_parts:
+        return f'{name} (PM only)'
+    if 'PM' in off_parts and 'AM' not in off_parts and 'BOTH' not in off_parts:
+        return f'{name} (AM only)'
+    return name
+
 
 def normalize_staff(staff,locs):
     out={l:{r:[] for r in ROLES} for l in locs}
@@ -180,7 +219,7 @@ def owner_map(staff,special):
             for n in row[role]: owners.setdefault(n,(loc,role))
     return owners
 
-def assignment_grid(staff,special,cfg,locs,key,edit,d,off_names):
+def assignment_grid(staff,special,cfg,locs,key,edit,d,off_names,session,current_ex):
     owners=owner_map(staff,special); taken=set(); duplicates=[]
     headers=st.columns([1.22,1.24,1.08,1.08,1.45,1.08])
     for c,t in zip(headers,['Location','MD','RN','MA','Sonographers','FOS']): c.markdown(f'**_{t}_**')
@@ -194,7 +233,8 @@ def assignment_grid(staff,special,cfg,locs,key,edit,d,off_names):
                 else: current.append(n); taken.add(n)
             row[role]=current
             klass='staff-readout '+('off' if off_row else ('special' if special_row else ''))
-            cols[i].markdown(f'<div class="{klass}">{", ".join(current) if current else "—"}</div>',unsafe_allow_html=True)
+            displayed = [display_name(n, name, d, session, current_ex) for n in current]
+            cols[i].markdown(f'<div class="{klass}">{", ".join(displayed) if displayed else "—"}</div>',unsafe_allow_html=True)
             if edit and not off_row:
                 choices=[]
                 for p in active_roster(cfg,role):
@@ -295,7 +335,7 @@ def _draw_table(draw, x, y, widths, headers, rows, header_fill, first_col_colors
     return y
 
 
-def huddle_png(d, metrics, staff, special, locs):
+def huddle_png(d, metrics, staff, special, locs, session, current_ex):
     margin = 18
     metric_widths = [150, 145, 115, 135, 130, 125, 105]
     staffing_widths = [135, 155, 145, 145, 220, 155]
@@ -316,7 +356,7 @@ def huddle_png(d, metrics, staff, special, locs):
     staffing_rows = []
     for loc in locs + SPECIAL_ROWS:
         row = staff[loc] if loc in staff else special[loc]
-        staffing_rows.append([loc] + [', '.join(row[role]) or '—' for role in ROLES])
+        staffing_rows.append([loc] + [', '.join(display_name(name, loc, d, session, current_ex) for name in row[role]) or '—' for role in ROLES])
 
     def table_height(rows, widths):
         total = 44
@@ -425,7 +465,7 @@ for i,loc in enumerate(locs):
     row=st.columns([1.35,1,1,1,1,1,1]); row[0].markdown(f'<span class="loc" style="color:{COLORS[i%len(COLORS)]}">{loc}</span>',unsafe_allow_html=True); record['metrics'].setdefault(loc,{})
     for j,m in enumerate(METRICS,1): record['metrics'][loc][m]=row[j].text_input(f'{loc}-{m}',str(record['metrics'][loc].get(m,'') or ''),label_visibility='collapsed',placeholder='0',key=f'm-{key}-{loc}-{m}')
 
-staff=normalize_staff(record.get('staffing') or baseline_staff(selected,session,cfg),locs); special=normalize_special(record.get('special_assignments',{})); current_ex=exceptions_for(selected); off_names={e['person'] for e in current_ex}
+staff=normalize_staff(record.get('staffing') or baseline_staff(selected,session,cfg),locs); special=normalize_special(record.get('special_assignments',{})); current_ex=exceptions_for(selected, session); off_names={e['person'] for e in current_ex if session != 'BOTH' or e.get('session', 'BOTH') == 'BOTH'}
 # Remove unavailable and off staff before rendering.
 roster_by_name={p['name']:p for p in active_roster(cfg)}
 for loc in locs:
@@ -437,7 +477,7 @@ for n in off_names:
     if n in roster_by_name:special['Off'][roster_by_name[n]['role']].append(n)
 st.markdown('<div class="sect" style="color:#cf303b">Staff Scheduling</div>',unsafe_allow_html=True)
 st.caption('All assignments stay visible. Turn on Edit staffing to select or unselect staff in place.')
-staff,special,duplicates=assignment_grid(staff,special,cfg,locs,key,edit,selected,off_names)
+staff,special,duplicates=assignment_grid(staff,special,cfg,locs,key,edit,selected,off_names,session,current_ex)
 if duplicates: st.error('Duplicate assignments were removed: '+', '.join(duplicates))
 with st.expander('Clinic operating overrides',False): record['staff_only_locations']=st.multiselect('Manually open without onsite MD',locs,default=[x for x in record['staff_only_locations'] if x in locs],key=f'so-{key}')
 staff,special,closed,pool,changes=auto_rebalance(staff,special,off_names,set(record['staff_only_locations']),cfg,selected); staff,special,duplicates=dedupe_assignments(staff,special); record['staffing']=staff; record['special_assignments']=special
@@ -465,16 +505,16 @@ if changes:
 with st.expander('Time off and coverage',True):
     roles=sorted({p['role'] for p in active_roster(cfg)}); c=st.columns([1,1.5,1,1]); role=c[0].selectbox('Job',roles,key='torole'); people=[p['name'] for p in active_roster(cfg,role)]; person=c[1].selectbox('Person',people,key='toperson'); start=c[2].date_input('From',selected,key='tostart'); end=c[3].date_input('To',selected,key='toend')
     if st.button('Add time off'):
-        ex=load_exceptions(); ex.append({'id':str(uuid.uuid4()),'person':person,'role':role,'start':str(start),'end':str(end),'location':'','replacement':''}); save_exceptions(ex); st.rerun()
+        ex=load_exceptions(); ex.append({'id':str(uuid.uuid4()),'person':person,'role':role,'start':str(start),'end':str(end),'session':session,'location':'','replacement':''}); save_exceptions(ex); st.rerun()
     if current_ex:
         for e in current_ex:
-            a,b=st.columns([6,1]); a.write(f"{e['person']} · {e['role']} · {e['start']} to {e['end']}")
+            a,b=st.columns([6,1]); a.write(f"{e['person']} · {e['role']} · {e.get('session', 'BOTH')} · {e['start']} to {e['end']}")
             if b.button('Reinstate',key=f"reinstate-{e.get('id',e['person']+e['start'])}"):
                 ex=load_exceptions(); ex=[x for x in ex if x.get('id')!=e.get('id')]; save_exceptions(ex); st.rerun()
     else:st.caption('No one is off for this date.')
 
 with st.expander('Share Daily Huddle picture',False):
-    png_bytes=huddle_png(selected,record['metrics'],staff,special,locs)
+    png_bytes=huddle_png(selected,record['metrics'],staff,special,locs,session,current_ex)
     st.image(png_bytes,caption='Daily Huddle picture preview',use_container_width=True)
     st.download_button('Download colorful Daily Huddle PNG',png_bytes,file_name=f'daily_huddle_{selected}.png',mime='image/png',use_container_width=True)
     st.caption('Download the PNG, then paste or attach it in Teams or email.')
