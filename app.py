@@ -242,10 +242,9 @@ def _wrap(draw, text, font, width):
 
 
 def _draw_table(draw, x, y, widths, headers, rows, header_fill, first_col_colors=None):
-    header_font = _font(30, True)
-    body_font = _font(28)
-    body_bold = _font(30, True)
-    pad = 12
+    header_font = _font(42, True)
+    body_font = _font(38)
+    body_bold = _font(40, True)    pad = 12
     header_h = 54
     xx = x
     for idx, (label, width) in enumerate(zip(headers, widths)):
