@@ -242,9 +242,9 @@ def _wrap(draw, text, font, width):
 
 
 def _draw_table(draw, x, y, widths, headers, rows, header_fill, first_col_colors=None):
-    header_font = _font(22, True)
-    body_font = _font(20)
-    body_bold = _font(20, True)
+    header_font = _font(30, True)
+    body_font = _font(28)
+    body_bold = _font(30, True)
     pad = 12
     header_h = 54
     xx = x
@@ -260,7 +260,7 @@ def _draw_table(draw, x, y, widths, headers, rows, header_fill, first_col_colors
             lines = _wrap(draw, value if value else '—', body_font, width - 2 * pad)
             wrapped.append(lines)
             max_lines = max(max_lines, len(lines))
-        row_h = max(50, 14 + max_lines * 25)
+        row_h = max(42, 10 + max_lines * 32)
         xx = x
         for col_index, (lines, width) in enumerate(zip(wrapped, widths)):
             fill = '#ffffff' if row_index % 2 == 0 else '#f5f7f9'
@@ -270,14 +270,14 @@ def _draw_table(draw, x, y, widths, headers, rows, header_fill, first_col_colors
             color = '#ffffff' if first_col_colors and col_index == 0 else '#343a40'
             font = body_bold if col_index == 0 else body_font
             for line_index, line in enumerate(lines):
-                draw.text((xx + pad, y + 9 + line_index * 25), line, font=font, fill=color)
+                draw.text((xx + pad, y + 6 + line_index * 32), line, font=font, fill=color)
             xx += width
         y += row_h
     return y
 
 
 def huddle_png(d, metrics, staff, special, locs):
-    width = 1900
+    width = 2800
     margin = 55
     title_font = _font(38, True)
     subtitle_font = _font(25, True)
@@ -287,7 +287,7 @@ def huddle_png(d, metrics, staff, special, locs):
 
     metric_widths = [250, 225, 190, 210, 210, 210, 180]
     metric_rows = [[loc] + [str(metrics.get(loc, {}).get(m, '') or '—') for m in METRICS] for loc in locs]
-    staffing_widths = [250, 280, 240, 240, 420, 300]
+    staffing_widths = [180, 230, 210, 210, 320, 220]
     staffing_rows = []
     for loc in locs + SPECIAL_ROWS:
         row = staff[loc] if loc in staff else special[loc]
