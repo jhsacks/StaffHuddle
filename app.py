@@ -1,9 +1,11 @@
 import json
+import csv
+import re
 from copy import deepcopy
 from datetime import date, datetime
 from pathlib import Path
 import uuid
-from io import BytesIO
+from io import BytesIO, StringIO
 from PIL import Image, ImageDraw, ImageFont
 import streamlit as st
 from storage import load_root, save_root, load_huddle, save_huddle, load_exceptions, save_exceptions
@@ -27,6 +29,83 @@ def list_value(v):
     return [x.strip() for x in str(v or '').split(',') if x.strip()]
 
 def csv_value(v): return ', '.join(list_value(v))
+
+def normalize_person_name(value):
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def parse_csv_date(value):
+    text = str(value or "").strip()
+    if not text: return None
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%a %b %d %Y %H:%M:%S GMT%z"):
+        try:
+            candidate = re.sub(r" \([^)]*\)$", "", text) if "GMT" in text else text
+            return datetime.strptime(candidate, fmt).date()
+        except ValueError: pass
+    return None
+
+
+def parse_csv_time(value):
+    for fmt in ("%I:%M %p", "%H:%M", "%H:%M:%S"):
+        try: return datetime.strptime(str(value or "").strip(), fmt).time()
+        except ValueError: pass
+    return None
+
+
+def smart_square_session(start_time, end_time):
+    if not start_time or not end_time: return "BOTH"
+    start_minutes = start_time.hour * 60 + start_time.minute
+    end_minutes = end_time.hour * 60 + end_time.minute
+    if end_minutes <= 750: return "AM"
+    if start_minutes >= 720: return "PM"
+    return "BOTH"
+
+
+def roster_name_match(smart_name, roster):
+    target = normalize_person_name(smart_name)
+    exact = [p for p in roster if normalize_person_name(p.get("name")) == target]
+    if len(exact) == 1: return exact[0]
+    first = target.split()[0] if target.split() else ""
+    matches = [p for p in roster if normalize_person_name(p.get("name")).split()[:1] == [first]]
+    if len(matches) == 1: return matches[0]
+    matches = [p for p in roster if normalize_person_name(p.get("name")) and normalize_person_name(p.get("name")) in target]
+    return matches[0] if len(matches) == 1 else None
+
+
+def sync_smart_square_csv(uploaded_file, cfg):
+    rows = list(csv.DictReader(StringIO(uploaded_file.getvalue().decode("utf-8-sig", errors="replace"))))
+    required = {"Name", "Request Type", "Status", "Date(s) Requested", "Request End Date", "id"}
+    missing = sorted(required - set(rows[0].keys() if rows else []))
+    if missing: raise ValueError("Missing required Smart Square columns: " + ", ".join(missing))
+    roster = active_roster(cfg); existing = load_exceptions()
+    by_id = {str(e.get("smart_square_id")): e for e in existing if e.get("smart_square_id")}
+    added = updated = removed = skipped = 0; unmatched = []
+    for row in rows:
+        request_id = str(row.get("id") or "").strip()
+        if not request_id or str(row.get("Request Type") or "").strip().upper() != "PTO": skipped += 1; continue
+        status = str(row.get("Status") or "").strip().upper()
+        if status != "APPROVED":
+            if request_id in by_id:
+                existing = [e for e in existing if str(e.get("smart_square_id")) != request_id]
+                by_id.pop(request_id, None); removed += 1
+            else: skipped += 1
+            continue
+        person = roster_name_match(row.get("Name"), roster)
+        if not person: unmatched.append(str(row.get("Name") or "").strip()); continue
+        start_date = parse_csv_date(row.get("Date(s) Requested")); end_date = parse_csv_date(row.get("Request End Date")) or start_date
+        if not start_date or not end_date: skipped += 1; continue
+        record = {"id": f"smartsquare-{request_id}", "smart_square_id": request_id, "source": "Smart Square",
+                  "person": person["name"], "role": person["role"], "start": str(start_date), "end": str(end_date),
+                  "session": smart_square_session(parse_csv_time(row.get("Request Start Time")), parse_csv_time(row.get("Request End Time"))),
+                  "start_time": row.get("Request Start Time", ""), "end_time": row.get("Request End Time", ""),
+                  "status": status, "unit": row.get("Unit", ""), "location": "", "replacement": "",
+                  "synced_at": datetime.now().isoformat(timespec="seconds")}
+        if request_id in by_id:
+            old = by_id[request_id]; saved_id = old.get("id", record["id"]); old.clear(); old.update(record); old["id"] = saved_id; updated += 1
+        else: existing.append(record); by_id[request_id] = record; added += 1
+    save_exceptions(existing)
+    return {"added": added, "updated": updated, "removed": removed, "skipped": skipped, "unmatched": sorted(set(filter(None, unmatched)))}
+
 
 def get_config():
     root=load_root(); cfg=root.setdefault('staffhuddle_config',{})
@@ -502,13 +581,27 @@ if changes:
     st.markdown('#### Automatic Coverage Changes')
     for x in changes:st.info(x)
 
+with st.expander('Sync Smart Square PTO',False):
+    st.caption('Download the latest Staff Requests CSV from Smart Square, upload it here, and sync approved PTO. Uploading a newer export updates existing Smart Square requests without duplicates.')
+    smart_square_file = st.file_uploader('Smart Square Staff Requests CSV', type=['csv'], key='smart-square-upload')
+    if st.button('Sync Smart Square PTO', type='primary', disabled=smart_square_file is None):
+        try:
+            st.session_state['smart_square_sync_result'] = sync_smart_square_csv(smart_square_file, cfg)
+            st.rerun()
+        except Exception as exc: st.error(f'Smart Square sync failed: {exc}')
+    sync_result = st.session_state.pop('smart_square_sync_result', None)
+    if sync_result:
+        st.success(f"Smart Square sync complete: {sync_result['added']} added, {sync_result['updated']} updated, {sync_result['removed']} removed, and {sync_result['skipped']} skipped.")
+        if sync_result['unmatched']: st.warning('Unmatched Smart Square names: ' + ', '.join(sync_result['unmatched']))
+        else: st.caption('All approved Smart Square names matched the Staff Huddle roster.')
+
 with st.expander('Time off and coverage',True):
     roles=sorted({p['role'] for p in active_roster(cfg)}); c=st.columns([1,1.5,1,1]); role=c[0].selectbox('Job',roles,key='torole'); people=[p['name'] for p in active_roster(cfg,role)]; person=c[1].selectbox('Person',people,key='toperson'); start=c[2].date_input('From',selected,key='tostart'); end=c[3].date_input('To',selected,key='toend')
     if st.button('Add time off'):
         ex=load_exceptions(); ex.append({'id':str(uuid.uuid4()),'person':person,'role':role,'start':str(start),'end':str(end),'session':session,'location':'','replacement':''}); save_exceptions(ex); st.rerun()
     if current_ex:
         for e in current_ex:
-            a,b=st.columns([6,1]); a.write(f"{e['person']} · {e['role']} · {e.get('session', 'BOTH')} · {e['start']} to {e['end']}")
+            a,b=st.columns([6,1]); source = f" · {e.get('source')}" if e.get('source') else ""; a.write(f"{e['person']} · {e['role']} · {e.get('session', 'BOTH')} · {e['start']} to {e['end']}{source}")
             if b.button('Reinstate',key=f"reinstate-{e.get('id',e['person']+e['start'])}"):
                 ex=load_exceptions(); ex=[x for x in ex if x.get('id')!=e.get('id')]; save_exceptions(ex); st.rerun()
     else:st.caption('No one is off for this date.')
