@@ -9,7 +9,7 @@ from io import BytesIO, StringIO
 from PIL import Image, ImageDraw, ImageFont
 from openpyxl import load_workbook
 import streamlit as st
-from storage import load_root, save_root, load_huddle, save_huddle, load_exceptions, save_exceptions
+from storage import load_root, save_root, load_huddle, save_huddle, load_exceptions, save_exceptions, save_qgenda_operational
 
 st.set_page_config(page_title='Pediatric Cardiology Daily Huddle', page_icon='🌼', layout='wide')
 BASELINE=json.loads((Path(__file__).parent/'data'/'baseline.json').read_text())
@@ -136,46 +136,130 @@ def qgenda_vacation_session(task):
 
 
 def sync_qgenda_vacation(uploaded_file, cfg):
-    workbook = load_workbook(BytesIO(uploaded_file.getvalue()), data_only=True, read_only=True)
+    raw = uploaded_file.getvalue()
+    workbook = load_workbook(BytesIO(raw), data_only=True, read_only=True)
     roster = active_roster(cfg, 'MD')
-    found, unmatched, export_dates = {}, [], []
+    found = {}
+    days = {}
+    unmatched = []
+    export_dates = []
+
     for sheet in workbook.worksheets:
         current_dates = {}
         for row in sheet.iter_rows(values_only=True):
             for name_col in range(0, len(row), 2):
                 left = row[name_col] if name_col < len(row) else None
                 right = row[name_col + 1] if name_col + 1 < len(row) else None
-                possible_date = parse_qgenda_date(left)
-                if possible_date:
-                    current_dates[name_col] = possible_date; export_dates.append(possible_date); continue
-                session = qgenda_vacation_session(right)
-                if not session or not left or name_col not in current_dates: continue
+                parsed_date = parse_qgenda_date(left)
+                if parsed_date:
+                    current_dates[name_col] = parsed_date
+                    export_dates.append(parsed_date)
+                    days.setdefault(str(parsed_date), {'call': {}, 'vacations': [], 'raw_call_entries': []})
+                    continue
+                if not left or name_col not in current_dates:
+                    continue
+                task = str(right or '').strip()
+                task_upper = task.upper()
+                vacation_session = qgenda_vacation_session(task)
+                office_call = task_upper == 'PEDS OFFICE CALL'
+                if not vacation_session and not office_call:
+                    continue
                 person = qgenda_name_match(left, roster)
-                if not person: unmatched.append(str(left).strip()); continue
-                vacation_date = current_dates[name_col]
-                key = f"{normalize_person_name(person['name'])}|{vacation_date}|{session}"
-                found[key] = {'id': f'qgenda-{key}', 'qgenda_key': key, 'source': 'QGenda',
-                    'person': person['name'], 'role': 'MD', 'start': str(vacation_date), 'end': str(vacation_date),
-                    'session': session, 'status': 'VACATION', 'location': '', 'replacement': '',
-                    'synced_at': datetime.now().isoformat(timespec='seconds')}
-    if not export_dates: raise ValueError('No calendar dates were found in the QGenda workbook.')
+                if not person:
+                    unmatched.append(str(left).strip())
+                    continue
+                work_date = current_dates[name_col]
+                date_key = str(work_date)
+                day = days.setdefault(date_key, {'call': {}, 'vacations': [], 'raw_call_entries': []})
+                if vacation_session:
+                    key = f"{normalize_person_name(person['name'])}|{work_date}|{vacation_session}"
+                    found[key] = {
+                        'id': f'qgenda-{key}', 'qgenda_key': key, 'source': 'QGenda',
+                        'person': person['name'], 'role': 'MD', 'start': date_key, 'end': date_key,
+                        'session': vacation_session, 'status': 'VACATION', 'location': '', 'replacement': '',
+                        'synced_at': datetime.now().isoformat(timespec='seconds')}
+                    item = {'person': person['name'], 'session': vacation_session}
+                    if item not in day['vacations']:
+                        day['vacations'].append(item)
+                if office_call:
+                    item = {'person': person['name'], 'task': task}
+                    if item not in day['raw_call_entries']:
+                        day['raw_call_entries'].append(item)
+
+    if not export_dates:
+        raise ValueError('No calendar dates were found in the QGenda workbook.')
     range_start, range_end = min(export_dates), max(export_dates)
+
     existing = load_exceptions()
     by_key = {e.get('qgenda_key'): e for e in existing if e.get('source') == 'QGenda' and e.get('qgenda_key')}
     added = updated = removed = 0
     for key, record in found.items():
         if key in by_key:
-            old = by_key[key]; saved_id = old.get('id', record['id']); old.clear(); old.update(record); old['id'] = saved_id; updated += 1
-        else: existing.append(record); added += 1
+            old = by_key[key]
+            saved_id = old.get('id', record['id'])
+            old.clear(); old.update(record); old['id'] = saved_id
+            updated += 1
+        else:
+            existing.append(record)
+            added += 1
     kept = []
     for entry in existing:
         entry_date = parse_csv_date(entry.get('start')) if entry.get('source') == 'QGenda' else None
         if entry_date and range_start <= entry_date <= range_end and entry.get('qgenda_key') not in found:
-            removed += 1; continue
-        kept.append(entry)
+            removed += 1
+        else:
+            kept.append(entry)
     save_exceptions(kept)
-    return {'added': added, 'updated': updated, 'removed': removed, 'vacations': len(found),
-        'unmatched': sorted(set(filter(None, unmatched))), 'range_start': str(range_start), 'range_end': str(range_end)}
+
+    names = sorted(p['name'] for p in roster)
+    call_counts = {name: {'weekday': 0.0, 'weekend': 0.0, 'total': 0.0} for name in names}
+    vacation_counts = {name: {'full_days': 0.0, 'half_days': 0.0, 'calendar_credit': 0.0} for name in names}
+    split_review = 0
+    for date_key, day in days.items():
+        callers = list(dict.fromkeys(x['person'] for x in day['raw_call_entries']))
+        if len(callers) == 1:
+            day['call'] = {'type': 'FULL_DAY', 'full_day': callers[0], 'morning': '', 'evening': '', 'display': callers[0]}
+            credits = [(callers[0], 1.0)]
+        elif len(callers) == 2:
+            day['call'] = {'type': 'SPLIT_UNORDERED', 'full_day': '', 'morning': '', 'evening': '', 'physicians': callers, 'display': ' / '.join(callers)}
+            credits = [(name, 0.5) for name in callers]
+            split_review += 1
+        elif len(callers) > 2:
+            day['call'] = {'type': 'REVIEW', 'full_day': '', 'morning': '', 'evening': '', 'physicians': callers, 'display': ' / '.join(callers)}
+            credits = [(name, 1.0 / len(callers)) for name in callers]
+            split_review += 1
+        else:
+            day['call'] = {'type': 'UNASSIGNED', 'full_day': '', 'morning': '', 'evening': '', 'display': 'Unassigned'}
+            credits = []
+        work_date = date.fromisoformat(date_key)
+        bucket = 'weekend' if work_date.strftime('%A') in ('Friday', 'Saturday', 'Sunday') else 'weekday'
+        for name, credit in credits:
+            call_counts[name][bucket] += credit
+            call_counts[name]['total'] += credit
+        for vacation in day['vacations']:
+            name, session = vacation['person'], vacation['session']
+            if session == 'BOTH':
+                vacation_counts[name]['full_days'] += 1.0
+                vacation_counts[name]['calendar_credit'] += 1.0
+            else:
+                vacation_counts[name]['half_days'] += 0.5
+                vacation_counts[name]['calendar_credit'] += 0.5
+
+    synced_at = datetime.now().isoformat(timespec='seconds')
+    call_dates = sum(day['call'].get('type') != 'UNASSIGNED' for day in days.values())
+    save_qgenda_operational({
+        'source': 'QGenda Calendar By Staff', 'synced_at': synced_at,
+        'range_start': str(range_start), 'range_end': str(range_end),
+        'physicians': names, 'days': days,
+        'counts': {'call': call_counts, 'vacation_calendar': vacation_counts},
+        'notes': {
+            'split_call': 'The Excel export identifies both split-call physicians but not AM/PM order. The Executive Dashboard annual plan resolves the order for the same physician pair.',
+            'vacation_counts': 'Calendar credits are provisional. The Executive Dashboard applies official weekday and office-closed holiday rules.'}})
+    return {
+        'added': added, 'updated': updated, 'removed': removed, 'vacations': len(found),
+        'call_dates': call_dates, 'split_review': split_review,
+        'unmatched': sorted(set(filter(None, unmatched))),
+        'range_start': str(range_start), 'range_end': str(range_end), 'synced_at': synced_at}
 
 
 def get_config():
@@ -666,17 +750,17 @@ with st.expander('Sync Smart Square PTO',False):
         if sync_result['unmatched']: st.warning('Unmatched Smart Square names: ' + ', '.join(sync_result['unmatched']))
         else: st.caption('All approved Smart Square names matched the Staff Huddle roster.')
 
-with st.expander('Sync QGenda Physician Vacation',False):
-    st.caption('Upload the QGenda Calendar By Staff Excel export. Only VACATION, VACATION AM, and VACATION PM for physicians in the active MD roster are imported. All other QGenda assignments are ignored.')
+with st.expander('Sync QGenda Call & Physician Vacation',False):
+    st.caption('Upload the QGenda Calendar By Staff Excel export. The upload imports Peds Office Call plus VACATION, VACATION AM, and VACATION PM for physicians in the active MD roster. Other QGenda assignments are ignored.')
     qgenda_file = st.file_uploader('QGenda Calendar By Staff Excel file', type=['xlsx'], key='qgenda-vacation-upload')
-    if st.button('Sync QGenda Physician Vacation', type='primary', disabled=qgenda_file is None):
+    if st.button('Sync QGenda Call & Vacation', type='primary', disabled=qgenda_file is None):
         try:
             st.session_state['qgenda_sync_result'] = sync_qgenda_vacation(qgenda_file, cfg)
             st.rerun()
         except Exception as exc: st.error(f'QGenda sync failed: {exc}')
     qgenda_result = st.session_state.pop('qgenda_sync_result', None)
     if qgenda_result:
-        st.success(f"QGenda sync complete: {qgenda_result['added']} added, {qgenda_result['updated']} updated, and {qgenda_result['removed']} removed. Found {qgenda_result['vacations']} vacation entries from {qgenda_result['range_start']} through {qgenda_result['range_end']}.")
+        st.success(f"QGenda sync complete: {qgenda_result['added']} vacation entries added, {qgenda_result['updated']} updated, and {qgenda_result['removed']} removed. Found {qgenda_result['vacations']} vacation entries and {qgenda_result['call_dates']} call dates from {qgenda_result['range_start']} through {qgenda_result['range_end']}. {qgenda_result['split_review']} split-call dates will use the Executive Dashboard annual plan to determine AM/PM order.")
         if qgenda_result['unmatched']: st.warning('Unmatched QGenda physician names: ' + ', '.join(qgenda_result['unmatched']))
         else: st.caption('All QGenda vacation names matched the active Staff Huddle MD roster.')
 
