@@ -7,6 +7,7 @@ from pathlib import Path
 import uuid
 from io import BytesIO, StringIO
 from PIL import Image, ImageDraw, ImageFont
+from openpyxl import load_workbook
 import streamlit as st
 from storage import load_root, save_root, load_huddle, save_huddle, load_exceptions, save_exceptions
 
@@ -105,6 +106,76 @@ def sync_smart_square_csv(uploaded_file, cfg):
         else: existing.append(record); by_id[request_id] = record; added += 1
     save_exceptions(existing)
     return {"added": added, "updated": updated, "removed": removed, "skipped": skipped, "unmatched": sorted(set(filter(None, unmatched)))}
+
+
+def parse_qgenda_date(value):
+    if isinstance(value, datetime): return value.date()
+    if isinstance(value, date): return value
+    text = str(value or '').strip()
+    for fmt in ('%B %d, %Y', '%m/%d/%Y', '%Y-%m-%d'):
+        try: return datetime.strptime(text, fmt).date()
+        except ValueError: pass
+    return None
+
+
+def qgenda_name_match(value, roster):
+    text = re.sub(r'\s*\([^)]*\)\s*$', '', str(value or '')).strip()
+    if ',' in text:
+        last, first = [x.strip() for x in text.split(',', 1)]
+        targets = {normalize_person_name(f'{first} {last}'), normalize_person_name(f'{last} {first}')}
+    else: targets = {normalize_person_name(text)}
+    matches = [p for p in roster if normalize_person_name(p.get('name')) in targets]
+    if len(matches) == 1: return matches[0]
+    last = normalize_person_name(text.split(',', 1)[0] if ',' in text else text.split()[-1])
+    matches = [p for p in roster if normalize_person_name(p.get('name')).split()[-1:] == [last]]
+    return matches[0] if len(matches) == 1 else None
+
+
+def qgenda_vacation_session(task):
+    return {'VACATION': 'BOTH', 'VACATION AM': 'AM', 'VACATION PM': 'PM'}.get(str(task or '').strip().upper())
+
+
+def sync_qgenda_vacation(uploaded_file, cfg):
+    workbook = load_workbook(BytesIO(uploaded_file.getvalue()), data_only=True, read_only=True)
+    roster = active_roster(cfg, 'MD')
+    found, unmatched, export_dates = {}, [], []
+    for sheet in workbook.worksheets:
+        current_dates = {}
+        for row in sheet.iter_rows(values_only=True):
+            for name_col in range(0, len(row), 2):
+                left = row[name_col] if name_col < len(row) else None
+                right = row[name_col + 1] if name_col + 1 < len(row) else None
+                possible_date = parse_qgenda_date(left)
+                if possible_date:
+                    current_dates[name_col] = possible_date; export_dates.append(possible_date); continue
+                session = qgenda_vacation_session(right)
+                if not session or not left or name_col not in current_dates: continue
+                person = qgenda_name_match(left, roster)
+                if not person: unmatched.append(str(left).strip()); continue
+                vacation_date = current_dates[name_col]
+                key = f"{normalize_person_name(person['name'])}|{vacation_date}|{session}"
+                found[key] = {'id': f'qgenda-{key}', 'qgenda_key': key, 'source': 'QGenda',
+                    'person': person['name'], 'role': 'MD', 'start': str(vacation_date), 'end': str(vacation_date),
+                    'session': session, 'status': 'VACATION', 'location': '', 'replacement': '',
+                    'synced_at': datetime.now().isoformat(timespec='seconds')}
+    if not export_dates: raise ValueError('No calendar dates were found in the QGenda workbook.')
+    range_start, range_end = min(export_dates), max(export_dates)
+    existing = load_exceptions()
+    by_key = {e.get('qgenda_key'): e for e in existing if e.get('source') == 'QGenda' and e.get('qgenda_key')}
+    added = updated = removed = 0
+    for key, record in found.items():
+        if key in by_key:
+            old = by_key[key]; saved_id = old.get('id', record['id']); old.clear(); old.update(record); old['id'] = saved_id; updated += 1
+        else: existing.append(record); added += 1
+    kept = []
+    for entry in existing:
+        entry_date = parse_csv_date(entry.get('start')) if entry.get('source') == 'QGenda' else None
+        if entry_date and range_start <= entry_date <= range_end and entry.get('qgenda_key') not in found:
+            removed += 1; continue
+        kept.append(entry)
+    save_exceptions(kept)
+    return {'added': added, 'updated': updated, 'removed': removed, 'vacations': len(found),
+        'unmatched': sorted(set(filter(None, unmatched))), 'range_start': str(range_start), 'range_end': str(range_end)}
 
 
 def get_config():
@@ -594,6 +665,20 @@ with st.expander('Sync Smart Square PTO',False):
         st.success(f"Smart Square sync complete: {sync_result['added']} added, {sync_result['updated']} updated, {sync_result['removed']} removed, and {sync_result['skipped']} skipped.")
         if sync_result['unmatched']: st.warning('Unmatched Smart Square names: ' + ', '.join(sync_result['unmatched']))
         else: st.caption('All approved Smart Square names matched the Staff Huddle roster.')
+
+with st.expander('Sync QGenda Physician Vacation',False):
+    st.caption('Upload the QGenda Calendar By Staff Excel export. Only VACATION, VACATION AM, and VACATION PM for physicians in the active MD roster are imported. All other QGenda assignments are ignored.')
+    qgenda_file = st.file_uploader('QGenda Calendar By Staff Excel file', type=['xlsx'], key='qgenda-vacation-upload')
+    if st.button('Sync QGenda Physician Vacation', type='primary', disabled=qgenda_file is None):
+        try:
+            st.session_state['qgenda_sync_result'] = sync_qgenda_vacation(qgenda_file, cfg)
+            st.rerun()
+        except Exception as exc: st.error(f'QGenda sync failed: {exc}')
+    qgenda_result = st.session_state.pop('qgenda_sync_result', None)
+    if qgenda_result:
+        st.success(f"QGenda sync complete: {qgenda_result['added']} added, {qgenda_result['updated']} updated, and {qgenda_result['removed']} removed. Found {qgenda_result['vacations']} vacation entries from {qgenda_result['range_start']} through {qgenda_result['range_end']}.")
+        if qgenda_result['unmatched']: st.warning('Unmatched QGenda physician names: ' + ', '.join(qgenda_result['unmatched']))
+        else: st.caption('All QGenda vacation names matched the active Staff Huddle MD roster.')
 
 with st.expander('Time off and coverage',True):
     roles=sorted({p['role'] for p in active_roster(cfg)}); c=st.columns([1,1.5,1,1]); role=c[0].selectbox('Job',roles,key='torole'); people=[p['name'] for p in active_roster(cfg,role)]; person=c[1].selectbox('Person',people,key='toperson'); start=c[2].date_input('From',selected,key='tostart'); end=c[3].date_input('To',selected,key='toend')
