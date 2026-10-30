@@ -1,71 +1,55 @@
 import json
 from copy import deepcopy
 from io import BytesIO
-
 import streamlit as st
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
 NAMESPACE = "daily_huddle"
+OPERATIONAL_KEY = "qgenda_operational"
 
 
 def _service():
     info = dict(st.secrets["google_service_account"])
-
     creds = service_account.Credentials.from_service_account_info(
         info,
-        scopes=["https://www.googleapis.com/auth/drive"]
+        scopes=["https://www.googleapis.com/auth/drive"],
     )
-
     return build(
         "drive",
         "v3",
         credentials=creds,
-        cache_discovery=False
+        cache_discovery=False,
     )
 
 
 def _find_file():
     service = _service()
-
     folder_id = st.secrets["google_drive"]["folder_id"]
     file_name = st.secrets["google_drive"]["file_name"]
-
+    safe_name = str(file_name).replace("'", "\\'")
     query = (
-        f"name='{file_name}' and "
+        f"name='{safe_name}' and "
         f"'{folder_id}' in parents and "
-        f"trashed=false"
+        "trashed=false"
     )
-
     result = service.files().list(
         q=query,
-        fields="files(id,name)"
+        fields="files(id,name)",
     ).execute()
-
     files = result.get("files", [])
-
     if not files:
-        raise FileNotFoundError(
-            f"{file_name} not found"
-        )
-
+        raise FileNotFoundError(f"{file_name} not found")
     return files[0]["id"]
 
 
 def load_root():
     try:
         file_id = _find_file()
-
-        raw = (
-            _service()
-            .files()
-            .get_media(fileId=file_id)
-            .execute()
-        )
-
-        return json.loads(raw.decode("utf-8"))
-
+        raw = _service().files().get_media(fileId=file_id).execute()
+        data = json.loads(raw.decode("utf-8"))
+        return data if isinstance(data, dict) else {}
     except Exception as exc:
         st.error(f"Google Drive load failed: {exc}")
         return {}
@@ -73,33 +57,25 @@ def load_root():
 
 def save_root(root):
     file_id = _find_file()
-
     payload = json.dumps(
         root,
         indent=2,
-        ensure_ascii=False
+        ensure_ascii=False,
+        default=str,
     ).encode("utf-8")
-
     media = MediaIoBaseUpload(
         BytesIO(payload),
         mimetype="application/json",
         resumable=False,
     )
-
-    (
-        _service()
-        .files()
-        .update(
-            fileId=file_id,
-            media_body=media
-        )
-        .execute()
-    )
+    _service().files().update(
+        fileId=file_id,
+        media_body=media,
+    ).execute()
 
 
 def load_huddle(date_key, session="BOTH"):
     root = load_root()
-
     return deepcopy(
         root.get(NAMESPACE, {})
         .get("records", {})
@@ -109,33 +85,57 @@ def load_huddle(date_key, session="BOTH"):
 
 def save_huddle(date_key, session, record):
     root = load_root()
-
-    root.setdefault(
-        NAMESPACE,
-        {}
-    ).setdefault(
-        "records",
-        {}
-    )[f"{date_key}|{session}"] = record
-
+    root.setdefault(NAMESPACE, {}).setdefault("records", {})[
+        f"{date_key}|{session}"
+    ] = record
     save_root(root)
 
 
 def load_exceptions():
     root = load_root()
-
     return deepcopy(
-        root.get(NAMESPACE, {})
-        .get("exceptions", [])
+        root.get(NAMESPACE, {}).get("exceptions", [])
     )
 
 
 def save_exceptions(items):
     root = load_root()
+    root.setdefault(NAMESPACE, {})["exceptions"] = items
+    save_root(root)
 
-    root.setdefault(
-        NAMESPACE,
-        {}
-    )["exceptions"] = items
 
+def load_qgenda_operational():
+    """Return the shared QGenda operational schedule.
+
+    Shape:
+    {
+        "source": "QGenda Calendar By Staff",
+        "synced_at": "ISO timestamp",
+        "range_start": "YYYY-MM-DD",
+        "range_end": "YYYY-MM-DD",
+        "physicians": [...],
+        "days": {
+            "YYYY-MM-DD": {
+                "call": {...},
+                "vacations": [...],
+                "raw_call_entries": [...]
+            }
+        },
+        "counts": {...}
+    }
+    """
+    root = load_root()
+    return deepcopy(root.get(OPERATIONAL_KEY, {}))
+
+
+def save_qgenda_operational(schedule):
+    """Save one shared QGenda operational dataset for all connected apps."""
+    root = load_root()
+    root[OPERATIONAL_KEY] = deepcopy(schedule or {})
+    save_root(root)
+
+
+def clear_qgenda_operational():
+    root = load_root()
+    root.pop(OPERATIONAL_KEY, None)
     save_root(root)
